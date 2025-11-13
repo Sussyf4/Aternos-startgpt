@@ -5,12 +5,14 @@
 set -o errexit
 
 npm install
-npm run build # if you have a build script, otherwise remove this line
+# Removed "npm run build" because we don't have a build step for this simple app
 
 # Store/cache Puppeteer executable
 npx puppeteer browsers install chrome
 
 # Install libraries required by Chrome on Linux
+# Note: If this fails on Render due to permissions, we might need to switch to a Dockerfile,
+# but for many standard environments, this is the attempt to get libraries.
 apt-get update && apt-get install -y \
   ca-certificates \
   fonts-liberation \
@@ -48,4 +50,5 @@ apt-get update && apt-get install -y \
   lsb-release \
   wget \
   xdg-utils
+
 
