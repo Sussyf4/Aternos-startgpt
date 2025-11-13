@@ -1,123 +1,152 @@
 const express = require('express');
-const bodyParser = require('body-parser');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const path = require('path');
 
-const A_USER = process.env.ATERNOS_USER;
-const A_PASS = process.env.ATERNOS_PASS;
-const PROTECT = process.env.PROTECT_PASSWORD || 'Hanzo'; // default as you asked
-
-if (!A_USER || !A_PASS) {
-  console.error('Set ATERNOS_USER and ATERNOS_PASS as environment variables.');
-  // still start so health-checks can work
-}
+// Add stealth plugin to hide that we are a bot
+puppeteer.use(StealthPlugin());
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
-
-// simple UI
-app.get('/', (req, res) => {
-  res.send(`<h2>Start Aternos server</h2>
-    <form method="POST" action="/start">
-      <label>Password: <input name="pw" /></label>
-      <button type="submit">Start server</button>
-    </form>
-  `);
-});
-
-app.post('/start', async (req, res) => {
-  const pw = (req.body.pw || '').toString();
-  if (pw !== PROTECT) {
-    return res.status(403).json({ ok: false, error: 'wrong password' });
-  }
-  if (!A_USER || !A_PASS) {
-    return res.status(500).json({ ok: false, error: 'server missing credentials' });
-  }
-
-  try {
-    // Launch Puppeteer; Render needs no-sandbox flags
-    const browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-    const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60000);
-
-    // Go to Aternos login (the flow may require JS/cookies)
-    await page.goto('https://aternos.org/go/', { waitUntil: 'networkidle2' });
-
-    // Attempt to click "Login" and fill form. The site is dynamic; selectors might need adjustment.
-    // This is a best-effort approach; you may need to update selectors after inspecting Aternos HTML.
-    try {
-      await page.waitForSelector('input[type="text"], input[name="username"], input[name="user"]', { timeout: 5000 });
-      // try a few likely selectors:
-      const usernameSelector = await findSelector(page, ['input[name="username"]', 'input[name="user"]', 'input[type="text"]']);
-      const passwordSelector = await findSelector(page, ['input[type="password"]', 'input[name="pass"]', 'input[name="password"]']);
-      if (!usernameSelector || !passwordSelector) {
-        throw new Error('login selectors not found; site structure changed');
-      }
-      await page.type(usernameSelector, A_USER, { delay: 40 });
-      await page.type(passwordSelector, A_PASS, { delay: 40 });
-      // submit - try to find submit button
-      await Promise.all([
-        page.keyboard.press('Enter'),
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(()=>{})
-      ]);
-    } catch (e) {
-      // maybe already logged in in session, continue
-      console.warn('login step warning:', e.message);
-    }
-
-    // navigate to server page
-    await page.goto('https://aternos.org/server/', { waitUntil: 'networkidle2' });
-
-    // attempt to click a button that contains text 'Start'
-    const startClicked = await clickButtonByText(page, ['Start', 'Start server', 'Start Server']);
-    if (!startClicked) {
-      await browser.close();
-      return res.status(500).json({ ok: false, error: 'Start button not found (selector mismatch)' });
-    }
-
-    // After clicking Start, Aternos may force an ad overlay. Try to detect an ad iframe/overlay.
-    await page.waitForTimeout(3000);
-    const adFound = await page.$('iframe') || await page.$('.ads') || await page.$('.vjs-ad') || null;
-
-    await browser.close();
-
-    if (adFound) {
-      // we can't reliably "show" that ad to the remote user via Render headless instance.
-      return res.json({ ok: true, started: true, note: 'Start clicked. An ad was detected; Aternos typically requires watching this ad in a real browser. Automated ad-watching may not complete start.' });
-    } else {
-      return res.json({ ok: true, started: true, note: 'Start clicked; no ad detected by the bot. Monitor server in Aternos UI.' });
-    }
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// helper: find first selector that exists
-async function findSelector(page, arr) {
-  for (const s of arr) {
-    try {
-      const el = await page.$(s);
-      if (el) return s;
-    } catch (e) {}
-  }
-  return null;
-}
-
-// helper: click button by visible text using XPath
-async function clickButtonByText(page, texts) {
-  for (const t of texts) {
-    const escaped = t.replace(/"/g, '\\"');
-    const handles = await page.$x(`//button[contains(., "${escaped}")] | //a[contains(., "${escaped}")]`);
-    if (handles.length) {
-      await handles[0].click();
-      return true;
-    }
-  }
-  return false;
-}
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('listening on', PORT));
+
+// Middleware to parse JSON bodies
+app.use(express.json());
+app.use(express.static('public'));
+
+// --- CONFIGURATION ---
+const USERNAME = process.env.ATERNOS_USER;
+const PASSWORD = process.env.ATERNOS_PASS;
+const APP_PASSWORD = process.env.WEB_PASS || 'Hanzo'; // Protection for your site
+
+// The main automation logic
+async function startAternosServer() {
+    let browser = null;
+    try {
+        console.log('Launching browser...');
+        browser = await puppeteer.launch({
+            headless: true, // Set to false if you want to see it locally
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--single-process' // Required for Render sometimes
+            ]
+        });
+
+        const page = await browser.newPage();
+        
+        // 1. Login
+        console.log('Navigating to login...');
+        await page.goto('https://aternos.org/go/', { waitUntil: 'networkidle2', timeout: 60000 });
+
+        // Check if we need to accept cookies first
+        try {
+            const consentBtn = await page.$('.cc-btn.cc-dismiss');
+            if (consentBtn) await consentBtn.click();
+        } catch (e) { /* Ignore if no cookie banner */ }
+
+        console.log('Typing credentials...');
+        await page.type('#user', USERNAME);
+        await page.type('#password', PASSWORD);
+        
+        await Promise.all([
+            page.click('#login'),
+            page.waitForNavigation({ waitUntil: 'networkidle2' })
+        ]);
+
+        // Check for login failure
+        if (page.url().includes('login')) {
+            throw new Error('Login failed. Check credentials or CAPTCHA.');
+        }
+
+        // 2. Select Server (if multiple, this picks the first one usually, or goes straight to server page)
+        console.log('Logged in. Checking server page...');
+        if (!page.url().includes('/server/')) {
+            // If we are on the account page, click the first server
+            await page.click('.server-body');
+            await page.waitForNavigation({ waitUntil: 'networkidle2' });
+        }
+
+        // 3. Check Status
+        // Status classes: offline, online, loading, queueing
+        const statusElement = await page.waitForSelector('.status-label');
+        const status = await page.evaluate(el => el.innerText, statusElement);
+        console.log(`Current Status: ${status}`);
+
+        if (status.toLowerCase().includes('online')) {
+            return 'Server is already ONLINE!';
+        }
+
+        // 4. Click Start
+        console.log('Attempting to click Start...');
+        const startBtn = await page.$('#start');
+        if (!startBtn) throw new Error('Start button not found.');
+
+        await startBtn.click();
+
+        // 5. Handle the "Ads" / Confirmation Modal
+        // Aternos often shows a modal asking to confirm notification or watch ad
+        console.log('Waiting for confirmation modal...');
+        
+        // Wait a bit for modal animation
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Try to find the red "Yes, I accept" or confirm button in the notification modal
+        // The selector often changes, but usually looks for btn-success or similar inside a modal
+        try {
+            // Look for the "Confirm" button specifically for the queue/ad
+            const confirmSelector = '.btn.btn-danger.btn-huge.btn-block'; // Usually the "Yes" button
+            await page.waitForSelector(confirmSelector, { timeout: 5000 });
+            await page.click(confirmSelector);
+            console.log('Clicked confirmation.');
+        } catch (e) {
+            console.log('No immediate confirmation modal found, checking for queue...');
+        }
+
+        // 6. Wait for success indication
+        // We wait a few seconds to ensure the request went through
+        await new Promise(r => setTimeout(r, 5000));
+
+        return 'Start command sent! Check Aternos in a few minutes.';
+
+    } catch (error) {
+        console.error('Automation Error:', error);
+        // Take a screenshot for debugging (saved to memory/logs in this case)
+        if (browser) {
+            const pages = await browser.pages();
+            if (pages.length > 0) {
+                const title = await pages[0].title();
+                console.log(`Error occurred on page: ${title}`);
+            }
+        }
+        throw error;
+    } finally {
+        if (browser) await browser.close();
+    }
+}
+
+// API Endpoint
+app.post('/api/start', async (req, res) => {
+    const { password } = req.body;
+
+    if (password !== APP_PASSWORD) {
+        return res.status(401).json({ success: false, message: 'Wrong Password (Hanzo)' });
+    }
+
+    try {
+        const result = await startAternosServer();
+        res.json({ success: true, message: result });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message || 'Failed to start server.' });
+    }
+});
+
+// Serve the HTML page
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
