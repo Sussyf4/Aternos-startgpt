@@ -9,6 +9,6 @@
   "dependencies": {
     "express": "^5.1.0",
     "body-parser": "^2.2.0",
-    "puppeteer": "^24.29.q"
+    "puppeteer": "^24.29.1"
   }
 }
